@@ -10,8 +10,18 @@
 <!--
   FitShala channel-attribution redirect page.
   On load: reads its own ?c= param + any pre-existing utm_* params + navigator.userAgent,
-  fires ONE PostHog capture (channel_link_opened) with $set_once first_channel,
-  then window.location.replace() to the correct app store.
+  fires ONE PostHog capture (channel_link_opened, sendBeacon transport) with
+  $set_once first_channel, then window.location.replace() to the correct app store.
+  Events go to the PostHog DEV project (326099) — the PROD project stays
+  app-usage-only.
+
+  Health events (failure instrumentation, best-effort, never block the redirect):
+    redirect_fallback_fired — SDK was up but the loaded-callback path didn't
+                              redirect within 2.5s (count may have been lost).
+    redirect_page_error     — window.onerror caught a JS exception; user was
+                              delivered to the store via the safe URL.
+  A fully blocked SDK (ad-blocker/offline) is inherently invisible: the user
+  still redirects at 2.5s; the count is accepted as lost.
 
   PRIVACY / RED LINES (deliberately NOT used — no fingerprinting):
   no canvas / toDataURL / getImageData / WebGL, no clipboard / execCommand,
@@ -26,10 +36,34 @@
   // ---- Store URLs (confirmed from lib/src/core/constants/app_strings.dart) ----
   const PLAY_PACKAGE = 'com.fitshala.fitshala_ai_app';  // live applicationId
   const APP_STORE_URL = 'https://apps.apple.com/us/app/fitshala-gym-workout-fitness/id6758107065';  // live App Store listing
+  // Dependency-free safe destination for the last-resort error path (no
+  // referrer, no channel — losing attribution is fine; stranding is not).
+  const SAFE_URL = 'https://play.google.com/store/apps/details?id=' + PLAY_PACKAGE;
+
+  // ---- Failure mode 2: a JS exception BEFORE the timers are armed would
+  // strand the user on a blank page forever. Register a zero-dependency
+  // last-resort handler FIRST, before any logic that could throw.
+  let redirected = false;
+  let redirectUrl = SAFE_URL;                             // overwritten by real logic below
+  function redirectNow() {
+    if (redirected) return;
+    redirected = true;
+    window.location.replace(redirectUrl);
+  }
+  window.onerror = function (message) {
+    try {
+      if (window.posthog && posthog.__loaded) {
+        posthog.capture('redirect_page_error',
+          { error_message: String(message).slice(0, 200) },
+          { transport: 'sendBeacon' });
+      }
+    } catch (_) { /* reporting must never block the redirect */ }
+    redirectNow();                                        // whatever broke, deliver the user
+  };
 
   // ---- 1. Resolve channel from own ?c= param (closed enum) ----
   const params = new URLSearchParams(window.location.search);
-  const VALID_BUCKETS = ['reddit', 'gym_qr', 'producthunt', 'whatsapp', 'other'];
+  const VALID_BUCKETS = ['reddit', 'gym_qr', 'producthunt', 'whatsapp', 'referral', 'other'];
   const rawC = params.get('c');
   let channel;
   if (rawC === null || rawC === '') {
@@ -47,7 +81,6 @@
   const target_store = isIOS ? 'ios' : 'android';         // unknown UA -> android default
 
   // ---- 3. Build the redirect URL ----
-  let redirectUrl;
   if (isIOS) {
     redirectUrl = APP_STORE_URL;                          // iOS: no referrer (no equivalent)
   } else {
@@ -68,34 +101,44 @@
     if (v !== null && v !== '') { props[k] = v; }
   });
 
-  // ---- Redirect: idempotent, so loaded-callback + hard fallback can't double-fire ----
-  let redirected = false;
-  function redirectNow() {
-    if (redirected) return;
-    redirected = true;
-    window.location.replace(redirectUrl);
-  }
-
-  // ---- PostHog init: pure counter, no autocapture / pageview / session recording ----
-  posthog.init('phc_PU94EpphWq2aso3m0zhUPx9wEFjnULvwaKCWuphiND6', {
+  // ---- 4 & 5. PostHog init (DEV project 326099 — keeps click-counter noise
+  // out of the PROD app-usage project) + ONE capture, then redirect.
+  //
+  // Failure mode 1 (the 2026-07-04 field bug): a queued-XHR capture is KILLED
+  // by location.replace() — the person appeared (via $pageleave's sendBeacon)
+  // but channel_link_opened never arrived. Fix: capture inside `loaded` with
+  // transport 'sendBeacon' — the browser guarantees beacon delivery after
+  // navigation — then redirect immediately. No grace-timer race at all.
+  posthog.init('phc_HbEWSS5XL2OBW7vIj7GHNEWaOAdiH9MxbVc2fYpJ2c9', {
     api_host: 'https://us.i.posthog.com',
     person_profiles: 'always',
     autocapture: false,
     capture_pageview: false,
     disable_session_recording: true,
-    // When the real SDK loads, the stub-queued capture below flushes immediately.
-    // Small grace so the network request actually leaves before we navigate away.
     loaded: function () {
-      setTimeout(redirectNow, 250);
+      try {
+        posthog.capture('channel_link_opened', props, { transport: 'sendBeacon' });
+      } catch (_) { /* counting must never block the redirect */ }
+      redirectNow();
     }
   });
 
-  // ---- 4 & 5. Fire ONE capture (queued by the stub until array.js loads) ----
-  posthog.capture('channel_link_opened', props);
-
-  // HARD FALLBACK: offline / blocked-analytics users must still reach the store.
-  // Losing the count is acceptable; stranding the user on a blank page is not.
-  setTimeout(redirectNow, 2500);
+  // HARD FALLBACK (failure modes 3+4): SDK slow or blocked — the user must
+  // still reach the store. Mode 3 (SDK up but loaded-callback never ran) is
+  // instrumented as redirect_fallback_fired; mode 4 (SDK fully blocked by
+  // ad-blocker/offline) is inherently invisible — accepted: losing the count
+  // is fine, stranding the user is not.
+  setTimeout(function () {
+    if (redirected) return;
+    try {
+      if (window.posthog && posthog.__loaded) {
+        posthog.capture('redirect_fallback_fired',
+          { channel: channel, target_store: target_store },
+          { transport: 'sendBeacon' });
+      }
+    } catch (_) { /* never block the redirect */ }
+    redirectNow();
+  }, 2500);
 </script>
 </body>
 </html>
