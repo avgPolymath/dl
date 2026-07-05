@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>FitShala</title>
+</head>
+<body>
+<!--
+  FitShala channel-attribution redirect page.
+  On load: reads its own ?c= param + any pre-existing utm_* params + navigator.userAgent,
+  fires ONE PostHog capture (channel_link_opened, sendBeacon transport) with
+  $set_once first_channel, then window.location.replace() to the correct app store.
+  Events go to the PostHog DEV project (326099) — the PROD project stays
+  app-usage-only.
+
+  Health events (failure instrumentation, best-effort, never block the redirect):
+    redirect_fallback_fired — SDK was up but the loaded-callback path didn't
+                              redirect within 2.5s (count may have been lost).
+    redirect_page_error     — window.onerror caught a JS exception; user was
+                              delivered to the store via the safe URL.
+  A fully blocked SDK (ad-blocker/offline) is inherently invisible: the user
+  still redirects at 2.5s; the count is accepted as lost.
+
+  PRIVACY / RED LINES (deliberately NOT used — no fingerprinting):
+  no canvas / toDataURL / getImageData / WebGL, no clipboard / execCommand,
+  no getBattery, no DeviceMotion / DeviceOrientation / Accelerometer / Gyroscope,
+  no navigator.plugins / hardwareConcurrency / deviceMemory enumeration,
+  no AudioContext, no fetch/XHR to any non-PostHog host.
+  This page counts a click; it does not fingerprint a device.
+-->
+<script>
+!function(t,e){var o,n,p,r;e.__SV||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+".people (stub)"},o="init capture register register_once register_for_session unregister unregister_for_session getFeatureFlag getFeatureFlagPayload isFeatureEnabled reloadFeatureFlags updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures on onFeatureFlags onSessionId getSurveys getActiveMatchingSurveys renderSurvey canRenderSurvey getNextSurveyStep identify setPersonProperties group resetGroups setPersonPropertiesForFlags resetPersonPropertiesForFlags setGroupPropertiesForFlags resetGroupPropertiesForFlags reset get_distinct_id getGroups get_session_id get_session_replay_url alias set_config startSessionRecording stopSessionRecording sessionRecordingStarted captureException loadToolbar get_property getSessionProperty createPersonProfile opt_in_capturing opt_out_capturing has_opted_in_capturing has_opted_out_capturing clear_opt_in_out_capturing debug getPageViewId captureTraceFeedback captureTraceMetric".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);
+
+  // ---- Store URLs (confirmed from lib/src/core/constants/app_strings.dart) ----
+  const PLAY_PACKAGE = 'com.fitshala.fitshala_ai_app';  // live applicationId
+  const APP_STORE_URL = 'https://apps.apple.com/us/app/fitshala-gym-workout-fitness/id6758107065';  // live App Store listing
+  // Dependency-free safe destination for the last-resort error path (no
+  // referrer, no channel — losing attribution is fine; stranding is not).
+  const SAFE_URL = 'https://play.google.com/store/apps/details?id=' + PLAY_PACKAGE;
+
+  // ---- Failure mode 2: a JS exception BEFORE the timers are armed would
+  // strand the user on a blank page forever. Register a zero-dependency
+  // last-resort handler FIRST, before any logic that could throw.
+  let redirected = false;
+  let redirectUrl = SAFE_URL;                             // overwritten by real logic below
+  function redirectNow() {
+    if (redirected) return;
+    redirected = true;
+    window.location.replace(redirectUrl);
+  }
+  window.onerror = function (message) {
+    try {
+      if (window.posthog && posthog.__loaded) {
+        posthog.capture('redirect_page_error',
+          { error_message: String(message).slice(0, 200) },
+          { transport: 'sendBeacon' });
+      }
+    } catch (_) { /* reporting must never block the redirect */ }
+    redirectNow();                                        // whatever broke, deliver the user
+  };
+
+  // ---- 1. Resolve channel from own ?c= param (closed enum) ----
+  const params = new URLSearchParams(window.location.search);
+  const VALID_BUCKETS = ['reddit', 'gym_qr', 'producthunt', 'whatsapp', 'referral', 'other'];
+  const rawC = params.get('c');
+  let channel;
+  if (rawC === null || rawC === '') {
+    channel = 'direct';                                   // c genuinely absent
+  } else if (VALID_BUCKETS.indexOf(rawC) !== -1) {
+    channel = rawC;                                       // known bucket
+  } else {
+    channel = 'other';                                    // present but unknown
+  }
+
+  // ---- 2. Device detect (userAgent only) ----
+  const ua = navigator.userAgent || '';
+  const isIOS = /iPhone|iPad|iPod/i.test(ua);
+  const isAndroid = /Android/i.test(ua);
+  const target_store = isIOS ? 'ios' : 'android';         // unknown UA -> android default
+
+  // ---- 3. Build the redirect URL ----
+  if (isIOS) {
+    redirectUrl = APP_STORE_URL;                          // iOS: no referrer (no equivalent)
+  } else {
+    // Android + unknown UA -> Play Store, with install referrer carrying the channel.
+    const referrer = encodeURIComponent('utm_source=' + channel);
+    redirectUrl = 'https://play.google.com/store/apps/details?id=' + PLAY_PACKAGE + '&referrer=' + referrer;
+  }
+
+  // ---- Build capture properties ----
+  const props = {
+    channel: channel,
+    target_store: target_store,
+    $set_once: { first_channel: channel }                 // first write wins; never overwritten
+  };
+  // utm_* ONLY if already present on this page's URL; omit key entirely when absent.
+  ['utm_source', 'utm_medium', 'utm_campaign'].forEach(function (k) {
+    const v = params.get(k);
+    if (v !== null && v !== '') { props[k] = v; }
+  });
+
+  // ---- 4 & 5. PostHog init (DEV project 326099 — keeps click-counter noise
+  // out of the PROD app-usage project) + ONE capture, then redirect.
+  //
+  // Failure mode 1 (the 2026-07-04 field bug): a queued-XHR capture is KILLED
+  // by location.replace() — the person appeared (via $pageleave's sendBeacon)
+  // but channel_link_opened never arrived. Fix: capture inside `loaded` with
+  // transport 'sendBeacon' — the browser guarantees beacon delivery after
+  // navigation — then redirect immediately. No grace-timer race at all.
+  posthog.init('phc_HbEWSS5XL2OBW7vIj7GHNEWaOAdiH9MxbVc2fYpJ2c9', {
+    api_host: 'https://us.i.posthog.com',
+    person_profiles: 'always',
+    autocapture: false,
+    capture_pageview: false,
+    disable_session_recording: true,
+    loaded: function () {
+      try {
+        posthog.capture('channel_link_opened', props, { transport: 'sendBeacon' });
+      } catch (_) { /* counting must never block the redirect */ }
+      redirectNow();
+    }
+  });
+
+  // HARD FALLBACK (failure modes 3+4): SDK slow or blocked — the user must
+  // still reach the store. Mode 3 (SDK up but loaded-callback never ran) is
+  // instrumented as redirect_fallback_fired; mode 4 (SDK fully blocked by
+  // ad-blocker/offline) is inherently invisible — accepted: losing the count
+  // is fine, stranding the user is not.
+  setTimeout(function () {
+    if (redirected) return;
+    try {
+      if (window.posthog && posthog.__loaded) {
+        posthog.capture('redirect_fallback_fired',
+          { channel: channel, target_store: target_store },
+          { transport: 'sendBeacon' });
+      }
+    } catch (_) { /* never block the redirect */ }
+    redirectNow();
+  }, 2500);
+</script>
+</body>
+</html>
