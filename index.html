@@ -9,7 +9,8 @@
 <body>
 <!--
   FitShala channel-attribution redirect page.
-  On load: reads its own ?c= param + any pre-existing utm_* params + navigator.userAgent,
+  On load: reads its own ?c= param + its utm_campaign key (kept only if it passes the
+  shape check; utm_source and utm_medium are never sent) + navigator.userAgent,
   fires ONE PostHog capture (channel_link_opened, sendBeacon transport) with
   $set_once first_channel, then window.location.replace() to the correct app store.
   Events go to the PostHog DEV project (326099) — the PROD project stays
@@ -63,7 +64,7 @@
 
   // ---- 1. Resolve channel from own ?c= param (closed enum) ----
   const params = new URLSearchParams(window.location.search);
-  const VALID_BUCKETS = ['reddit', 'gym_qr', 'producthunt', 'whatsapp', 'referral', 'other'];
+  const VALID_BUCKETS = ['reddit', 'gym_qr', 'producthunt', 'whatsapp', 'referral', 'other', 'instagram', 'creator', 'trainer'];
   const rawC = params.get('c');
   let channel;
   if (rawC === null || rawC === '') {
@@ -73,6 +74,12 @@
   } else {
     channel = 'other';                                    // present but unknown
   }
+
+  // ---- 1b. Campaign key: our own short key (g01, cr07), shape-checked; anything else is left out ----
+  // Must equal kCampaignKeyPattern in the app's install_referrer_reader.dart (a test reads both).
+  const CAMPAIGN_KEY_PATTERN = /^[a-z]{1,4}[0-9]{1,4}$/;
+  const rawCampaign = params.get('utm_campaign');
+  const campaignKey = (rawCampaign !== null && CAMPAIGN_KEY_PATTERN.test(rawCampaign)) ? rawCampaign : null;
 
   // ---- 2. Device detect (userAgent only) ----
   const ua = navigator.userAgent || '';
@@ -85,7 +92,7 @@
     redirectUrl = APP_STORE_URL;                          // iOS: no referrer (no equivalent)
   } else {
     // Android + unknown UA -> Play Store, with install referrer carrying the channel.
-    const referrer = encodeURIComponent('utm_source=' + channel);
+    const referrer = encodeURIComponent('utm_source=' + channel + (campaignKey !== null ? '&utm_campaign=' + campaignKey : ''));
     redirectUrl = 'https://play.google.com/store/apps/details?id=' + PLAY_PACKAGE + '&referrer=' + referrer;
   }
 
@@ -95,11 +102,10 @@
     target_store: target_store,
     $set_once: { first_channel: channel }                 // first write wins; never overwritten
   };
-  // utm_* ONLY if already present on this page's URL; omit key entirely when absent.
-  ['utm_source', 'utm_medium', 'utm_campaign'].forEach(function (k) {
-    const v = params.get(k);
-    if (v !== null && v !== '') { props[k] = v; }
-  });
+  // utm_campaign ONLY as the shape-checked campaign key (step 1b); a key that
+  // fails the shape is left out. utm_source and utm_medium are never copied:
+  // they are typed by whoever made the link, and no reader needs them (TD-260928-03).
+  if (campaignKey !== null) { props.utm_campaign = campaignKey; }
 
   // ---- 4 & 5. PostHog init (DEV project 326099 — keeps click-counter noise
   // out of the PROD app-usage project) + ONE capture, then redirect.
